@@ -15,15 +15,16 @@ const state = {
 
 /* Map setup using MapLibre with MapTiler tiles (no token required for OSM raster fallback) */
 function initMap() {
+  // Use free public style if no key is provided
   const satUrl = state.maptilerKey
     ? `https://api.maptiler.com/maps/hybrid/style.json?key=${state.maptilerKey}`
-    : 'https://api.maptiler.com/maps/hybrid/style.json?key=Get_Your_Own_Demo_Key';
+    : 'https://demotiles.maplibre.org/style.json';
   const streetsUrl = state.maptilerKey
     ? `https://api.maptiler.com/maps/streets/style.json?key=${state.maptilerKey}`
-    : 'https://api.maptiler.com/maps/streets/style.json?key=Get_Your_Own_Demo_Key';
+    : 'https://demotiles.maplibre.org/style.json';
   const trafficUrl = state.maptilerKey
     ? `https://api.maptiler.com/maps/traffic-day/style.json?key=${state.maptilerKey}`
-    : 'https://api.maptiler.com/maps/traffic-day/style.json?key=Get_Your_Own_Demo_Key';
+    : 'https://demotiles.maplibre.org/style.json';
 
   const style = state.mapStyleBase === 'sat' ? satUrl : (state.mapStyleBase === 'traffic' ? trafficUrl : streetsUrl);
 
@@ -166,31 +167,7 @@ function projectToSelected(lnglat) {
 
 /* UI Handlers */
 function bindUI() {
-  document.getElementById('btnBase').addEventListener('click', () => {
-    state.mapStyleBase = state.mapStyleBase === 'sat' ? 'streets' : 'sat';
-    const cur = state.map.getCenter();
-    const z = state.map.getZoom();
-    state.map.remove();
-    initMap();
-    state.map.setCenter(cur);
-    state.map.setZoom(z);
-    renderWorkingPolygon(Boolean(state.polygon));
-  });
-  document.getElementById('btnTraffic').addEventListener('click', () => {
-    if (!state.maptilerKey) { alert('برای ترافیک کلید MapTiler لازم است'); return; }
-    state.mapStyleBase = state.mapStyleBase === 'traffic' ? 'streets' : 'traffic';
-    const cur = state.map.getCenter();
-    const z = state.map.getZoom();
-    state.map.remove();
-    initMap();
-    state.map.setCenter(cur);
-    state.map.setZoom(z);
-    renderWorkingPolygon(Boolean(state.polygon));
-  });
-  document.getElementById('btnLocate').addEventListener('click', () => {
-    if (!state.lastFix) return;
-    state.map.easeTo({ center: [state.lastFix.coords.longitude, state.lastFix.coords.latitude], zoom: 18 });
-  });
+  // Map style toggle buttons removed per request
   document.getElementById('btnCapture').addEventListener('click', capturePoint);
   document.getElementById('btnFinish').addEventListener('click', finishPolygon);
   document.getElementById('btnDraw').addEventListener('click', () => renderWorkingPolygon(true));
