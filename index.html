@@ -1,5 +1,174 @@
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>نقشه‌بردار میدانی - UTM</title>
+  <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">نقشه utm</div>
+    <div class="gps-stats" id="gpsStats">
+      <span id="statAccuracy">دقت: —</span>
+      <span id="statSat">ماهواره: —</span>
+      <span id="statDOP">DOP: —</span>
+    </div>
+  </header>
+
+  <main class="app">
+    <section class="map-panel">
+      <div id="map" class="map"></div>
+      <div class="map-tools">
+        <button id="btnBase" class="tool">ماهواره/نقشه</button>
+        <button id="btnTraffic" class="tool">ترافیک</button>
+        <button id="btnLocate" class="tool">موقیعت من</button>
+      </div>
+    </section>
+
+    <section class="controls">
+      <button id="btnCapture" class="primary">برداشت نقطه</button>
+      <button id="btnFinish" class="secondary">اتمام</button>
+      <button id="btnDraw" class="secondary">ترسیم روی نقشه</button>
+      <button id="btnReview" class="accent">بررسی</button>
+      <button id="btnSettings" class="ghost">تنظیمات</button>
+    </section>
+
+    <section class="data-panel">
+      <div class="info-box">
+        <div>تعداد نقاط: <span id="pointCount">0</span></div>
+        <div>مساحت: <span id="areaText">—</span></div>
+      </div>
+      <div class="table-wrap">
+        <table id="coordTable">
+          <thead>
+            <tr><th>#</th><th>X</th><th>Y</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <!-- Dialog: Settings -->
+  <dialog id="dlgSettings" class="dialog">
+    <form method="dialog" class="form">
+      <h3>تنظیمات</h3>
+      <label>سیستم مختصات جدول
+        <select id="coordSystem">
+          <option value="utm">UTM</option>
+          <option value="wgs84">WGS84 (lat/lon)</option>
+        </select>
+      </label>
+      <label>زون UTM
+        <input id="utmZone" type="number" min="1" max="60" placeholder="مثلاً 39" />
+      </label>
+      <label>میانگین‌گیری GPS (ثانیه)
+        <input id="avgSeconds" type="number" min="1" max="60" value="5" />
+      </label>
+      <label>کلید MapTiler برای ترافیک/ماهواره (اختیاری)
+        <input id="maptilerKey" type="text" placeholder="کلید MapTiler" />
+      </label>
+      <div class="row">
+        <button id="btnNmea" type="button">اتصال GNSS (NMEA)</button>
+        <div class="hint">برای نمایش ماهواره‌ها و DOP</div>
+      </div>
+      <menu>
+        <button value="cancel">بستن</button>
+        <button id="btnSaveSettings" value="default">ذخیره</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Dialog: Review / User Info -->
+  <dialog id="dlgReview" class="dialog">
+    <form method="dialog" class="form" id="reviewForm">
+      <h3>فرم اطلاعات</h3>
+      <div class="grid2">
+        <label>نام و نام خانوادگی
+          <input id="f_name" required />
+        </label>
+        <label>نام پدر
+          <input id="f_father" />
+        </label>
+        <label>کد ملی
+          <input id="f_nid" />
+        </label>
+        <label>منطقه
+          <input id="f_region" />
+        </label>
+        <label>پلاک اصلی
+          <input id="f_plak_main" />
+        </label>
+        <label>پلاک فرعی
+          <input id="f_plak_sub" />
+        </label>
+      </div>
+      <div class="info-box small">مساحت به صورت خودکار محاسبه می‌شود: <b id="areaAuto">—</b></div>
+      <menu>
+        <button value="cancel">انصراف</button>
+        <button id="btnConfirmReview" value="default">تایید</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <!-- Report (A4) hidden preview -->
+  <section id="report" class="report a4" hidden>
+    <div class="report-inner">
+      <div class="left">
+        <div class="box map-simple">
+          <canvas id="canvasSimple" width="1480" height="900"></canvas>
+          <div class="edge-note">طول اضلاع روی شکل درج شده است</div>
+        </div>
+        <div class="box table">
+          <table id="reportTable">
+            <thead><tr><th>#</th><th>X</th><th>Y</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="right">
+        <div class="box info">
+          <h2>اطلاعات نقشه UTM</h2>
+          <div class="row"><span>نام:</span><b id="r_name"></b></div>
+          <div class="row"><span>نام پدر:</span><b id="r_father"></b></div>
+          <div class="row"><span>کد ملی:</span><b id="r_nid"></b></div>
+          <div class="row"><span>منطقه:</span><b id="r_region"></b></div>
+          <div class="row"><span>پلاک اصلی:</span><b id="r_plak_main"></b></div>
+          <div class="row"><span>پلاک فرعی:</span><b id="r_plak_sub"></b></div>
+          <div class="row emph"><span>مساحت (m²):</span><b id="r_area"></b></div>
+        </div>
+        <div class="box map-sat">
+          <canvas id="canvasSat" width="1200" height="750"></canvas>
+        </div>
+        <div class="box map-traffic">
+          <canvas id="canvasTraffic" width="1200" height="420"></canvas>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="downloads" id="downloads" hidden>
+    <button id="btnDownloadPDF" class="primary">دانلود PDF</button>
+    <button id="btnDownloadKML" class="secondary">دانلود KML</button>
+    <button id="btnDownloadDXF" class="secondary">دانلود DXF</button>
+  </footer>
+
+  <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+  <script src="https://unpkg.com/proj4@2.11.0/dist/proj4.js"></script>
+  <script src="https://unpkg.com/jspdf@2.5.2/dist/jspdf.umd.min.js"></script>
+  <script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
