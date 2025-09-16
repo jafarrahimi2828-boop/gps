@@ -1,3 +1,479 @@
+/* Core state */
+const state = {
+  map: null,
+  mapStyleBase: 'streets', // 'streets' | 'sat' | 'traffic'
+  maptilerKey: localStorage.getItem('maptilerKey') || '',
+  utmZone: Number(localStorage.getItem('utmZone') || 39),
+  coordSystem: localStorage.getItem('coordSystem') || 'utm',
+  avgSeconds: Number(localStorage.getItem('avgSeconds') || 5),
+  positions: [],
+  polygon: null,
+  watchId: null,
+  lastFix: null,
+  nmea: { sats: 0, dop: null },
+};
+
+/* Map setup using MapLibre with MapTiler tiles (no token required for OSM raster fallback) */
+function initMap() {
+  const satUrl = state.maptilerKey
+    ? `https://api.maptiler.com/maps/hybrid/style.json?key=${state.maptilerKey}`
+    : 'https://api.maptiler.com/maps/hybrid/style.json?key=Get_Your_Own_Demo_Key';
+  const streetsUrl = state.maptilerKey
+    ? `https://api.maptiler.com/maps/streets/style.json?key=${state.maptilerKey}`
+    : 'https://api.maptiler.com/maps/streets/style.json?key=Get_Your_Own_Demo_Key';
+  const trafficUrl = state.maptilerKey
+    ? `https://api.maptiler.com/maps/traffic-day/style.json?key=${state.maptilerKey}`
+    : 'https://api.maptiler.com/maps/traffic-day/style.json?key=Get_Your_Own_Demo_Key';
+
+  const style = state.mapStyleBase === 'sat' ? satUrl : (state.mapStyleBase === 'traffic' ? trafficUrl : streetsUrl);
+
+  state.map = new maplibregl.Map({
+    container: 'map',
+    style,
+    center: [51.389, 35.689],
+    zoom: 13,
+    attributionControl: true,
+  });
+
+  state.map.addControl(new maplibregl.NavigationControl({ showCompass: true }), 'top-right');
+}
+
+/* Geolocation */
+function startWatch() {
+  if (!('geolocation' in navigator)) return;
+  if (state.watchId) navigator.geolocation.clearWatch(state.watchId);
+  state.watchId = navigator.geolocation.watchPosition(onPosition, onGeoError, {
+    enableHighAccuracy: true,
+    maximumAge: 1000,
+    timeout: 15000,
+  });
+}
+
+function onPosition(pos) {
+  state.lastFix = pos;
+  const { latitude, longitude, accuracy } = pos.coords;
+  updateStatsUI(accuracy, state.nmea.sats, state.nmea.dop);
+  drawSelf(latitude, longitude, accuracy);
+}
+
+function onGeoError(err) {
+  console.warn('Geolocation error', err);
+}
+
+function drawSelf(lat, lon, accuracy) {
+  if (!state.map) return;
+  const center = [lon, lat];
+  if (!state.selfMarker) {
+    state.selfMarker = new maplibregl.Marker({ color: '#00d084' }).setLngLat(center).addTo(state.map);
+  } else {
+    state.selfMarker.setLngLat(center);
+  }
+}
+
+/* Capture with averaging */
+async function capturePoint() {
+  if (!state.lastFix) return alert('موقعیت در دسترس نیست');
+  const seconds = Math.max(1, state.avgSeconds);
+  const samples = [];
+  const start = Date.now();
+  const take = () => {
+    if (state.lastFix) {
+      const { latitude, longitude } = state.lastFix.coords;
+      samples.push([longitude, latitude]);
+    }
+    if ((Date.now() - start) / 1000 >= seconds) {
+      const avg = averageLngLat(samples);
+      addPoint(avg);
+    } else {
+      setTimeout(take, 1000);
+    }
+  };
+  take();
+}
+
+function averageLngLat(points) {
+  if (points.length === 0) return null;
+  let x = 0, y = 0;
+  for (const p of points) { x += p[0]; y += p[1]; }
+  return [x / points.length, y / points.length];
+}
+
+function addPoint(lnglat) {
+  state.positions.push(lnglat);
+  updatePointTable();
+  renderWorkingPolygon();
+}
+
+function finishPolygon() {
+  if (state.positions.length < 3) return alert('حداقل سه نقطه لازم است');
+  state.polygon = turf.polygon([[...state.positions, state.positions[0]]]);
+  renderWorkingPolygon(true);
+  const area = turf.area(state.polygon);
+  document.getElementById('areaText').textContent = area.toFixed(2) + ' m²';
+}
+
+function renderWorkingPolygon(final = false) {
+  if (!state.map) return;
+  const id = 'work-poly';
+  const exists = state.map.getSource(id);
+  const feature = state.positions.length >= 2
+    ? turf.lineString(state.positions)
+    : turf.featureCollection([]);
+  const poly = (final && state.polygon) ? state.polygon : null;
+
+  const data = poly ? poly : feature;
+  if (exists) {
+    state.map.getSource(id).setData(data);
+  } else {
+    state.map.addSource(id, { type: 'geojson', data });
+    state.map.addLayer({ id: 'work-line', type: 'line', source: id, paint: { 'line-color': '#00d084', 'line-width': 3 } });
+    state.map.addLayer({ id: 'work-fill', type: 'fill', source: id, paint: { 'fill-color': '#00d084', 'fill-opacity': 0.2 } });
+  }
+  document.getElementById('pointCount').textContent = String(state.positions.length);
+}
+
+function updatePointTable() {
+  const body = document.querySelector('#coordTable tbody');
+  body.innerHTML = '';
+  let idx = 1;
+  for (const lnglat of state.positions) {
+    const [x, y] = projectToSelected(lnglat);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${idx}</td><td>${x.toFixed(3)}</td><td>${y.toFixed(3)}</td>`;
+    body.appendChild(tr);
+    idx++;
+  }
+}
+
+/* Projection helpers */
+// Define UTM projection dynamically using proj4
+function getProj() {
+  if (state.coordSystem === 'wgs84') return null;
+  const zone = state.utmZone;
+  const isNorth = true; // Iran mostly north hemisphere
+  const epsg = `+proj=utm +zone=${zone} ${isNorth ? '+north' : '+south'} +datum=WGS84 +units=m +no_defs`;
+  return proj4('WGS84', epsg);
+}
+
+function projectToSelected(lnglat) {
+  if (state.coordSystem === 'wgs84') {
+    return lnglat; // [lon,lat]
+  }
+  const p = getProj();
+  const out = p.forward([lnglat[0], lnglat[1]]);
+  return out; // [x,y]
+}
+
+/* UI Handlers */
+function bindUI() {
+  document.getElementById('btnBase').addEventListener('click', () => {
+    state.mapStyleBase = state.mapStyleBase === 'sat' ? 'streets' : 'sat';
+    const cur = state.map.getCenter();
+    const z = state.map.getZoom();
+    state.map.remove();
+    initMap();
+    state.map.setCenter(cur);
+    state.map.setZoom(z);
+    renderWorkingPolygon(Boolean(state.polygon));
+  });
+  document.getElementById('btnTraffic').addEventListener('click', () => {
+    if (!state.maptilerKey) { alert('برای ترافیک کلید MapTiler لازم است'); return; }
+    state.mapStyleBase = state.mapStyleBase === 'traffic' ? 'streets' : 'traffic';
+    const cur = state.map.getCenter();
+    const z = state.map.getZoom();
+    state.map.remove();
+    initMap();
+    state.map.setCenter(cur);
+    state.map.setZoom(z);
+    renderWorkingPolygon(Boolean(state.polygon));
+  });
+  document.getElementById('btnLocate').addEventListener('click', () => {
+    if (!state.lastFix) return;
+    state.map.easeTo({ center: [state.lastFix.coords.longitude, state.lastFix.coords.latitude], zoom: 18 });
+  });
+  document.getElementById('btnCapture').addEventListener('click', capturePoint);
+  document.getElementById('btnFinish').addEventListener('click', finishPolygon);
+  document.getElementById('btnDraw').addEventListener('click', () => renderWorkingPolygon(true));
+  document.getElementById('btnSettings').addEventListener('click', () => document.getElementById('dlgSettings').showModal());
+  document.getElementById('btnSaveSettings').addEventListener('click', saveSettings);
+  document.getElementById('btnNmea').addEventListener('click', connectNMEA);
+  document.getElementById('btnReview').addEventListener('click', openReview);
+  document.getElementById('btnConfirmReview').addEventListener('click', confirmReview);
+  document.getElementById('btnDownloadPDF').addEventListener('click', downloadPDF);
+  document.getElementById('btnDownloadKML').addEventListener('click', downloadKML);
+  document.getElementById('btnDownloadDXF').addEventListener('click', downloadDXF);
+}
+
+function saveSettings() {
+  const zone = Number(document.getElementById('utmZone').value || state.utmZone);
+  const coordSystem = document.getElementById('coordSystem').value;
+  const avgSeconds = Number(document.getElementById('avgSeconds').value || 5);
+  const key = document.getElementById('maptilerKey').value.trim();
+  state.utmZone = zone; state.coordSystem = coordSystem; state.avgSeconds = avgSeconds; state.maptilerKey = key;
+  localStorage.setItem('utmZone', String(zone));
+  localStorage.setItem('coordSystem', coordSystem);
+  localStorage.setItem('avgSeconds', String(avgSeconds));
+  localStorage.setItem('maptilerKey', key);
+}
+
+function updateStatsUI(accuracy, sats, dop) {
+  document.getElementById('statAccuracy').textContent = `دقت: ${accuracy ? accuracy.toFixed(1) + 'm' : '—'}`;
+  document.getElementById('statSat').textContent = `ماهواره: ${sats || '—'}`;
+  document.getElementById('statDOP').textContent = `DOP: ${dop || '—'}`;
+}
+
+/* NMEA via Web Serial (optional) */
+async function connectNMEA() {
+  if (!('serial' in navigator)) { alert('مرورگر از Web Serial پشتیبانی نمی‌کند'); return; }
+  try {
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 9600 });
+    const decoder = new TextDecoderStream();
+    const reader = port.readable.pipeThrough(decoder).getReader();
+    let buffer = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += value;
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) parseNMEA(line.trim());
+    }
+  } catch (e) {
+    console.warn('NMEA error', e);
+  }
+}
+
+function parseNMEA(line) {
+  if (!line.startsWith('$')) return;
+  if (line.includes('$GPGGA') || line.includes('$GNGGA')) {
+    // $GPGGA,time,lat,NS,lon,EW,fix,numSV,HDOP,alt,unit,sep,unit,diffAge,diffStation*cs
+    const parts = line.split(',');
+    const numSV = Number(parts[7]);
+    const hdop = parts[8];
+    state.nmea.sats = numSV || state.nmea.sats;
+    state.nmea.dop = hdop || state.nmea.dop;
+    if (state.lastFix) updateStatsUI(state.lastFix.coords.accuracy, state.nmea.sats, state.nmea.dop);
+  }
+}
+
+/* Review and Report generation */
+function openReview() {
+  if (!state.polygon) return alert('ابتدا پلیگون را نهایی کنید');
+  const area = turf.area(state.polygon);
+  document.getElementById('areaAuto').textContent = area.toFixed(2) + ' m²';
+  document.getElementById('dlgReview').showModal();
+}
+
+function confirmReview() {
+  const name = document.getElementById('f_name').value;
+  const father = document.getElementById('f_father').value;
+  const nid = document.getElementById('f_nid').value;
+  const region = document.getElementById('f_region').value;
+  const plakMain = document.getElementById('f_plak_main').value;
+  const plakSub = document.getElementById('f_plak_sub').value;
+  // Fill report panel
+  document.getElementById('r_name').textContent = name;
+  document.getElementById('r_father').textContent = father;
+  document.getElementById('r_nid').textContent = nid;
+  document.getElementById('r_region').textContent = region;
+  document.getElementById('r_plak_main').textContent = plakMain;
+  document.getElementById('r_plak_sub').textContent = plakSub;
+  const area = turf.area(state.polygon);
+  document.getElementById('r_area').textContent = area.toFixed(2);
+
+  // Populate report table
+  const tbody = document.querySelector('#reportTable tbody');
+  tbody.innerHTML = '';
+  state.positions.forEach((lnglat, i) => {
+    const [x, y] = projectToSelected(lnglat);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${i + 1}</td><td>${x.toFixed(3)}</td><td>${y.toFixed(3)}</td>`;
+    tbody.appendChild(tr);
+  });
+
+  // Draw simple polygon with edge lengths
+  drawSimpleCanvas();
+  // Prefer real static maps if key exists
+  if (state.maptilerKey) {
+    drawStaticMap('canvasSat', 'hybrid');
+    drawStaticMap('canvasTraffic', 'traffic-day');
+  } else {
+    drawMapCanvas('canvasSat');
+    drawMapCanvas('canvasTraffic', true);
+  }
+
+  document.getElementById('report').hidden = false;
+  document.getElementById('downloads').hidden = false;
+}
+
+function drawSimpleCanvas() {
+  const canvas = document.getElementById('canvasSimple');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  if (!state.polygon) return;
+  const ring = state.polygon.geometry.coordinates[0];
+  // Project to UTM meters for proper scaling
+  const proj = getProj();
+  const pts = ring.map(([lon,lat]) => proj.forward([lon,lat]));
+  // Normalize to canvas
+  const xs = pts.map(p=>p[0]); const ys = pts.map(p=>p[1]);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const pad = 60;
+  const w = canvas.width - pad*2; const h = canvas.height - pad*2;
+  const scale = Math.min(w/(maxX-minX), h/(maxY-minY));
+  const toCanvas = (p)=> [ pad + (p[0]-minX)*scale, canvas.height - (pad + (p[1]-minY)*scale) ];
+  const cpts = pts.map(toCanvas);
+
+  // Fill polygon
+  ctx.beginPath();
+  cpts.forEach((p,i)=>{ if(i===0) ctx.moveTo(p[0],p[1]); else ctx.lineTo(p[0],p[1]); });
+  ctx.closePath();
+  ctx.fillStyle = '#f7f7f7';
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 2;
+  ctx.fill();
+  ctx.stroke();
+
+  // Edge lengths
+  ctx.fillStyle = '#111';
+  ctx.font = '28px sans-serif';
+  for (let i=0;i<cpts.length-1;i++){
+    const a = pts[i];
+    const b = pts[i+1];
+    const ca = cpts[i];
+    const cb = cpts[i+1];
+    const len = Math.hypot(b[0]-a[0], b[1]-a[1]);
+    const mx = (ca[0]+cb[0])/2; const my = (ca[1]+cb[1])/2;
+    ctx.fillText(len.toFixed(2)+' m', mx+4, my-4);
+  }
+}
+
+// Render map image via current map viewport (simplified: just draw vector centerline screenshot via HTML2Canvas alternative skipped)
+async function drawMapCanvas(canvasId, traffic=false) {
+  const canvas = document.getElementById(canvasId);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ddd';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  // Draw polygon projected onto canvas from geo bounds
+  if (!state.polygon) return;
+  const bounds = turf.bbox(state.polygon);
+  const [minLon,minLat,maxLon,maxLat] = bounds;
+  const pad = 20;
+  const w = canvas.width - pad*2; const h = canvas.height - pad*2;
+  const scaleX = w/(maxLon-minLon); const scaleY = h/(maxLat-minLat);
+  const scale = Math.min(scaleX, scaleY);
+  const toCanvas = ([lon,lat]) => [ pad + (lon-minLon)*scale, canvas.height - (pad + (lat-minLat)*scale) ];
+  const ring = state.polygon.geometry.coordinates[0].map(toCanvas);
+  ctx.beginPath();
+  ring.forEach((p,i)=>{ if(i===0) ctx.moveTo(p[0],p[1]); else ctx.lineTo(p[0],p[1]); });
+  ctx.closePath();
+  ctx.strokeStyle = '#d00'; ctx.lineWidth = 3; ctx.stroke();
+}
+
+// Render Static Map (MapTiler) and overlay polygon
+async function drawStaticMap(canvasId, style) {
+  const canvas = document.getElementById(canvasId);
+  const ctx = canvas.getContext('2d');
+  const bbox = turf.bbox(state.polygon);
+  const center = [(bbox[0]+bbox[2])/2, (bbox[1]+bbox[3])/2];
+  const zoom = bboxToZoom(bbox, canvas.width, canvas.height);
+  const url = `https://api.maptiler.com/maps/${style}/static/${center[0]},${center[1]},${zoom}/${canvas.width}x${canvas.height}.png?key=${state.maptilerKey}&attribution=false`;
+  await drawImageOnCanvas(ctx, url, canvas.width, canvas.height);
+  // overlay polygon
+  const [minLon,minLat,maxLon,maxLat] = bbox;
+  const pad = 0; // static already fits
+  const w = canvas.width - pad*2; const h = canvas.height - pad*2;
+  const scaleX = w/(maxLon-minLon); const scaleY = h/(maxLat-minLat);
+  const scale = Math.min(scaleX, scaleY);
+  const toCanvas = ([lon,lat]) => [ pad + (lon-minLon)*scale, canvas.height - (pad + (lat-minLat)*scale) ];
+  const ring = state.polygon.geometry.coordinates[0].map(toCanvas);
+  ctx.beginPath();
+  ring.forEach((p,i)=>{ if(i===0) ctx.moveTo(p[0],p[1]); else ctx.lineTo(p[0],p[1]); });
+  ctx.closePath();
+  ctx.strokeStyle = '#ff2a2a'; ctx.lineWidth = 3; ctx.stroke();
+}
+
+function bboxToZoom([minLon,minLat,maxLon,maxLat], width, height) {
+  // rough formula assuming WebMercator
+  const WORLD_DIM = { height: 256, width: 256 };
+  const ZOOM_MAX = 22;
+  function latRad(lat) {
+    const sin = Math.sin(lat * Math.PI / 180);
+    const radX2 = Math.log((1 + sin) / (1 - sin)) / 2;
+    return Math.max(Math.min(radX2, Math.PI), -Math.PI) / 2;
+  }
+  function zoom(mapPx, worldPx, fraction) { return Math.floor(Math.log(mapPx / worldPx / fraction) / Math.LN2); }
+  const latFraction = (latRad(maxLat) - latRad(minLat)) / Math.PI;
+  const lonDiff = maxLon - minLon;
+  const lonFraction = ((lonDiff < 0) ? (lonDiff + 360) : lonDiff) / 360;
+  const latZoom = zoom(height, WORLD_DIM.height, latFraction);
+  const lonZoom = zoom(width, WORLD_DIM.width, lonFraction);
+  return Math.min(latZoom, lonZoom, ZOOM_MAX-1);
+}
+
+function drawImageOnCanvas(ctx, url, w, h) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => { ctx.drawImage(img, 0, 0, w, h); resolve(); };
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+/* Exports */
+async function downloadPDF() {
+  const { jsPDF } = window.jspdf;
+  const node = document.getElementById('report');
+  const canvas = await html2canvas(node, { scale: 2, backgroundColor: '#ffffff' });
+  const img = canvas.toDataURL('image/jpeg', 0.95);
+  const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  pdf.addImage(img, 'JPEG', 0, 0, 210, 297);
+  pdf.save('utm-report.pdf');
+}
+
+function downloadKML() {
+  if (!state.polygon) return;
+  const coords = state.polygon.geometry.coordinates[0];
+  const kml = `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark><name>Polygon</name><Polygon><outerBoundaryIs><LinearRing><coordinates>${coords.map(c=>c.join(',')).join(' ')}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></kml>`;
+  saveBlob(new Blob([kml], {type:'application/vnd.google-earth.kml+xml'}), 'polygon.kml');
+}
+
+function downloadDXF() {
+  if (!state.polygon) return;
+  // Very simple DXF polyline in WGS84 degrees; many CAD accept; for true meters convert to UTM
+  const proj = getProj();
+  const coords = state.polygon.geometry.coordinates[0].map(([lon,lat]) => proj.forward([lon,lat]));
+  let dxf = `0\nSECTION\n2\nENTITIES\n`;
+  dxf += `0\nLWPOLYLINE\n8\n0\n90\n${coords.length}\n70\n1\n`;
+  for (const [x,y] of coords) { dxf += `10\n${x}\n20\n${y}\n`; }
+  dxf += `0\nENDSEC\n0\nEOF`;
+  saveBlob(new Blob([dxf], {type:'application/dxf'}), 'polygon.dxf');
+}
+
+function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  setTimeout(()=> URL.revokeObjectURL(url), 1000);
+}
+
+/* Boot */
+window.addEventListener('DOMContentLoaded', () => {
+  // preload settings
+  document.getElementById('utmZone').value = String(state.utmZone);
+  document.getElementById('coordSystem').value = state.coordSystem;
+  document.getElementById('avgSeconds').value = String(state.avgSeconds);
+  document.getElementById('maptilerKey').value = state.maptilerKey;
+
+  initMap();
+  bindUI();
+  startWatch();
+});
+
 /* Military GPS Web App for GitHub Pages */
 
 // Map style: dark military (MapLibre-compatible raster tiles from Carto/OSM alternatives)
